@@ -1,0 +1,16 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "mpiexec-setup",
+        "type": "shell",
+        "command": "mpiexec",
+        "args": [
+          "-n", "1",
+          "python", "./scripts/cm_train_mri.py"
+        ],
+        "problemMatcher": []
+      }
+    ]
+  }
+  

@@ -1,1 +1,7 @@
 flash-attention/
+output_logs/
+outputs_first20/
+outputs_fastmri/
+*.pt
+*.log
+__pycache__/

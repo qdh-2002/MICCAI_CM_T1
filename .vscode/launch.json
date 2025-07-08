@@ -1,0 +1,108 @@
+// {
+//     // Use IntelliSense to learn about possible attributes.
+//     // Hover to view descriptions of existing attributes.
+//     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Python Debugger: Current File",
+//             "type": "debugpy",
+//             "request": "launch",
+//             "program": "${file}",
+//             "console": "integratedTerminal"
+//         }
+//     ]
+// }
+
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//       {
+//         "name": "Python Debugger: Current File",
+//         "type": "debugpy",
+//         "request": "launch",
+//         "program": "${file}",
+//         "cwd": "/raid/kaifengpang/iCM_MRI_throughplane",
+//         "console": "integratedTerminal",
+//         "args": [
+//           "--training_mode", "consistency_training",
+//           "--target_ema_mode", "improved",
+//           "--start_ema", "0.95",
+//           "--scale_mode", "ladder",
+//           "--start_scales", "10",
+//           "--end_scales", "1280",
+//           "--total_training_steps", "800000",
+//           "--loss_norm", "PH-l2",
+//           "--lr_anneal_steps", "0",
+//           // "--attention_resolutions", "32,16,8",
+//           "--use_scale_shift_norm", "False",
+//           "--dropout", "0.2",
+//           "--teacher_dropout", "0.2",
+//           "--ema_rate", "0.9999,0.99994,0.9999432189950708",
+//           "--global_batch_size", "4",
+//           "--image_size", "320",
+//           "--lr", "0.00005",
+//           "--num_channels", "64",
+//           "--num_head_channels", "64",
+//           "--num_res_blocks", "1",
+//           "--resblock_updown", "True",
+//           "--schedule_sampler", "uniform",
+//           "--use_fp16", "True",
+//           "--weight_decay", "0.0",
+//           "--weight_schedule", "uniform",
+//           "--save_dir", "./save/debug_1119",
+//           "--save_interval", "1",
+//           "--epoch", "95",
+//           "--channel_mult", "1,2,4,8,16",
+//           "--scan", "cor",
+//           "--scale", "5.76",
+//           "--crop", "288"
+//         ],
+//         "env": {
+//           "PYTHONPATH": "/raid/kaifengpang/iCM_MRI_throughplane:${PYTHONPATH}"
+//         },
+//         "preLaunchTask": "mpiexec-setup"
+//       }
+//     ]
+//   }
+  
+
+
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python Debugger: Current File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "/raid/kaifengpang/iCM_MRI_throughplane",
+      "args": [
+        "--training_mode", "consistency_distillation",
+        "--sampler", "onestep",
+        "--model_path", "/raid/kaifengpang/iCM_MRI_throughplane/save/train_IDX_cor_SP_x576e-2/target_model400000.pt",
+        // "--attention_resolutions", "",
+        "--use_scale_shift_norm", "True",
+        "--dropout", "0.0",
+        "--image_size", "320",
+        "--num_channels", "64",
+        "--num_head_channels", "64",
+        "--num_res_blocks", "1",
+        "--resblock_updown", "True",
+        "--use_fp16", "True",
+        "--weight_schedule", "uniform",
+        "--save_dir", "./save/debug_1119",
+        "--channel_mult", "1,2,4,8,16",
+        "--scan", "cor",
+        "--crop", "288",
+        "--scale", "5.76",
+      ],
+      "env": {
+        "PYTHONPATH": "/raid/kaifengpang/iCM_MRI_throughplane:${PYTHONPATH}",
+        "CUDA_LAUNCH_BLOCKING": "1"
+      },
+      "preLaunchTask": "mpiexec-setup"
+    }
+  ]
+}
