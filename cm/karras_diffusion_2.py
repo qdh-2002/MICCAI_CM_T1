@@ -2,6 +2,9 @@
 Based on: https://github.com/crowsonkb/k-diffusion
 """
 import random
+import os
+from pathlib import Path
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch as th
@@ -16,6 +19,19 @@ from .random_util import get_generator
 from tqdm import tqdm
 import math
 from torch.amp import autocast, GradScaler
+
+def kde_density(x: th.Tensor, eval_pts: th.Tensor, bandwidth: float) -> th.Tensor:
+    ##Kernel Density Estimation with Gaussian kernel.
+    # flatten to [N,1]
+    x_flat = x.reshape(-1, 1)           # [N,1]
+    pts    = eval_pts.reshape(1, -1)    # [1,M]
+    diffs  = (x_flat - pts) / bandwidth # [N,M]
+    K      = th.exp(-0.5 * diffs**2) # [N,M]
+    # mean≈integral, then divided by Gaussian normalization factor
+    density = K.mean(dim=0) / (bandwidth * math.sqrt(2*math.pi))
+    # normalize so sum(density)≈1
+    return density / (density.sum() + 1e-8)
+
 def get_weightings(weight_schedule, snrs, sigma_data):
     if weight_schedule == "snr":
         weightings = snrs
@@ -42,7 +58,10 @@ class KarrasDenoiser:
         weight_schedule="karras",
         distillation=False,
         loss_norm="lpips",
-        adaptive_loss = False
+        adaptive_loss = False,
+        save_images=False,
+        image_save_dir="./training_images",
+        save_frequency=100
     ):
         self.sigma_data = sigma_data
         self.sigma_max = sigma_max
@@ -51,6 +70,10 @@ class KarrasDenoiser:
         self.distillation = distillation
         self.loss_norm = loss_norm
         self.adaptive_loss = adaptive_loss
+        self.save_images = save_images
+        self.image_save_dir = image_save_dir
+        self.save_frequency = save_frequency
+        self.training_step = 0  # Keep track of training steps
         print('Loss:', loss_norm)
         if loss_norm == "lpips":
             self.lpips_loss = LPIPS(replace_pooling=True, reduction="none")
@@ -91,7 +114,32 @@ class KarrasDenoiser:
 
         dims = x_start.ndim
         x_t = x_start + noise * append_dims(sigmas, dims)
-        model_output, denoised = self.denoise(model, x_t, sigmas, **model_kwargs)
+        #model_output, denoised = self.denoise(model, x_t, sigmas, **model_kwargs)
+        model_output, denoised = self.denoise(
+            model, x_t, sigmas,
+            model_kwargs["hr_inte"],
+        )
+
+        # Save denoised images if enabled
+        if self.save_images and self.training_step % self.save_frequency == 0:
+            save_denoised_images(
+                x_start, 
+                os.path.join(self.image_save_dir, "original"), 
+                "original", 
+                step=self.training_step
+            )
+            save_denoised_images(
+                x_t, 
+                os.path.join(self.image_save_dir, "noisy"), 
+                "noisy", 
+                step=self.training_step
+            )
+            save_denoised_images(
+                denoised, 
+                os.path.join(self.image_save_dir, "denoised"), 
+                "denoised", 
+                step=self.training_step
+            )
 
         snrs = self.get_snr(sigmas)
         weights = append_dims(
@@ -100,10 +148,36 @@ class KarrasDenoiser:
         terms["xs_mse"] = mean_flat((denoised - x_start) ** 2)
         terms["mse"] = mean_flat(weights * (denoised - x_start) ** 2)
 
+
+        ### Remapping the pixel values to [0, 255] range, greyscale
+        x_in_255 = (x_start.clamp(-1, 1) + 1) / 2 * 255.0
+        x_out_255 = (denoised.clamp(-1, 1) + 1) / 2 * 255.0
+
+        ### Define the evaluation points for KDE and bandwidth
+        M = 128
+        eval_pts = th.linspace(0, 255, M).to(x_start.device)  # [M]
+        #bandwidth = 5.0
+        pixels   = x_out_255.reshape(-1)
+        N        = pixels.numel()
+        sigma    = pixels.std(unbiased=True).item()
+        bandwidth= 1.06 * sigma * (N ** (-1/5))
+
+        ### Compute the densities using KDE
+        density_in = kde_density(x_in_255, eval_pts, bandwidth)  # [M]
+        density_out = kde_density(x_out_255, eval_pts, bandwidth)  # [M]
+
+        ## Compute the 
+        kde_loss = th.sum(density_in * (th.log(density_in + 1e-8) - th.log(density_out + 1e-8)))
+        terms["kde"] = kde_loss
+
+
         if "vb" in terms:
-            terms["loss"] = terms["mse"] + terms["vb"]
+            terms["loss"] = terms["mse"] + terms["vb"] + terms["kde"]
         else:
-            terms["loss"] = terms["mse"]
+            terms["loss"] = terms["mse"] + terms["kde"]
+
+        # Increment training step counter
+        self.training_step += 1
 
         return terms
 
@@ -127,14 +201,14 @@ class KarrasDenoiser:
 
         dims = x_start.ndim
 
-        def denoise_fn(x, t, hr_inte):
-            return self.denoise(model, x, t, hr_inte)[1]
+        def denoise_fn(x, t, hr_inte, mask=None):
+            return self.denoise(model, x, t, hr_inte, mask=mask)[1]
 
         if target_model:
 
             @th.no_grad()
-            def target_denoise_fn(x, t, hr_inte):
-                return self.denoise(target_model, x, t, hr_inte)[1]
+            def target_denoise_fn(x, t, hr_inte, mask=None):
+                return self.denoise(target_model, x, t, hr_inte, mask=mask)[1]
 
         else:
             raise NotImplementedError("Must have a target model")
@@ -142,8 +216,8 @@ class KarrasDenoiser:
         if teacher_model:
 
             @th.no_grad()
-            def teacher_denoise_fn(x, t, hr_inte):
-                return teacher_diffusion.denoise(teacher_model, x, t, hr_inte)[1]
+            def teacher_denoise_fn(x, t, hr_inte, mask=None):
+                return teacher_diffusion.denoise(teacher_model, x, t, hr_inte, mask=mask)[1]
 
         @th.no_grad()
         def heun_solver(samples, t, next_t, x0, hr_inte):
@@ -177,37 +251,6 @@ class KarrasDenoiser:
 
             return samples
 
-        # @th.no_grad()
-        # def compute_noise_schedule(num_scales, sigma_min, sigma_max, rho, P_mean, P_std):
-        #     """
-        #     Compute the noise schedule for a given number of scales and parameters.
-        #     """
-        #     # Compute sigma_i values
-        #     i_values = th.arange(0, num_scales, device="cuda")
-        #     sigma_i = ((sigma_min ** (1 / rho) + i_values / (num_scales - 1) * 
-        #             (sigma_max ** (1 / rho) - sigma_min ** (1 / rho))) ** rho)
-            
-        #     # Compute log(sigma_i) for the probability distribution
-        #     log_sigma = th.log(sigma_i)
-            
-        #     # Compute probabilities using erf
-        #     prob = th.erf((log_sigma[1:] - P_mean) / (math.sqrt(2) * P_std)) - th.erf(
-        #         (log_sigma[:-1] - P_mean) / (math.sqrt(2) * P_std)
-        #     )
-            
-        #     # Normalize probabilities
-        #     prob = prob / prob.sum()
-        #     return sigma_i, prob
-
-        # indices = th.randint(
-        #     0, num_scales - 1, (x_start.shape[0],), device=x_start.device
-        # )
-        # iCM
-        # _, prob = compute_noise_schedule(num_scales, self.sigma_min, self.sigma_max, self.rho, P_mean = -1.1, P_std = 2.0)
-        # indices = th.multinomial(prob, x_start.shape[0], replacement=True).to(x_start.device)
-
-
-
         P_mean = -1.1
         P_std = 2.0
         max_n_scales = 1281
@@ -224,17 +267,6 @@ class KarrasDenoiser:
 
         t = th.from_numpy(ts[indices + 1]).to(x_start.device).float()  # t > t2!
         t2 = th.from_numpy(ts[indices]).to(x_start.device).float()
-
-
-        # t = self.sigma_min ** (1 / self.rho) + indices / (num_scales - 1) * (
-        #     self.sigma_max ** (1 / self.rho) - self.sigma_min ** (1 / self.rho)
-        # )
-        # t = t**self.rho
-
-        # t2 = self.sigma_min ** (1 / self.rho) + (indices + 1) / (num_scales - 1) * (
-        #     self.sigma_max ** (1 / self.rho) - self.sigma_min ** (1 / self.rho)
-        # )
-        # t2 = t2**self.rho
 
         x_t = x_start + noise * append_dims(t, dims)
         
@@ -255,18 +287,40 @@ class KarrasDenoiser:
         distiller_target = target_denoise_fn(x_t2, t2, hr_inte)
         distiller_target = distiller_target.detach()
 
-        # snrs = self.get_snr(t)
-        # weights = get_weightings(self.weight_schedule, snrs, self.sigma_data)
 
-        # iCM
-        # @th.no_grad()
-        # def new_loss_weights(num_scales, sigma_min, sigma_max, rho):
-        #     i_values = th.arange(0, num_scales, device="cuda")
-        #     sigma_i = ((sigma_min ** (1 / rho) + i_values / (num_scales - 1) * 
-        #             (sigma_max ** (1 / rho) - sigma_min ** (1 / rho))) ** rho)
-            
-        #     return 1 / (sigma_i[1:] - sigma_i[:-1])
-        # weights = new_loss_weights(num_scales, self.sigma_min, self.sigma_max, self.rho)[indices]
+        # Save consistency training images if enabled
+        if self.save_images and self.training_step % self.save_frequency == 0:
+            save_denoised_images(
+                x_start, 
+                os.path.join(self.image_save_dir, "consistency_original"), 
+                "consistency_original", 
+                step=self.training_step
+            )
+            save_denoised_images(
+                x_t, 
+                os.path.join(self.image_save_dir, "consistency_noisy_t"), 
+                "consistency_noisy_t", 
+                step=self.training_step
+            )
+            save_denoised_images(
+                x_t2, 
+                os.path.join(self.image_save_dir, "consistency_noisy_t2"), 
+                "consistency_noisy_t2", 
+                step=self.training_step
+            )
+            save_denoised_images(
+                distiller, 
+                os.path.join(self.image_save_dir, "consistency_pred"), 
+                "consistency_pred", 
+                step=self.training_step
+            )
+            save_denoised_images(
+                distiller_target, 
+                os.path.join(self.image_save_dir, "consistency_target"), 
+                "consistency_target", 
+                step=self.training_step
+            )
+
         weights = 1 / (th.abs(t2 - t) + 1e-20)
 
         if self.loss_norm == "l1":
@@ -300,26 +354,11 @@ class KarrasDenoiser:
             loss = mean_flat(diffs) * weights
         elif self.loss_norm == "lpips":
             if x_start.shape[-1] < 256:
-                distiller = F.interpolate(distiller, size=224, mode="bilinear")
+                distiller = F.interpolate(distiller, size=128, mode="bilinear")
                 distiller_target = F.interpolate(
-                    distiller_target, size=224, mode="bilinear"
+                    distiller_target, size=128, mode="bilinear"
                 )
 
-#            loss = (
-#                self.lpips_loss(
-#                    (distiller + 1) / 2.0,
-#                    (distiller_target + 1) / 2.0,
-#                )
-#                * weights
-#            )   
-#                
-#        else:
-#            raise ValueError(f"Unknown loss norm {self.loss_norm}")
-#
-#        terms = {}
-#        terms["loss"] = loss
-#
-#        return terms
 
 
             loss = (
@@ -332,20 +371,15 @@ class KarrasDenoiser:
         else:
             raise ValueError(f"Unknown loss norm {self.loss_norm}")
 
-        # --------------------------------------------------------------------
-        # Return the scalar loss plus the three intermediate tensors:
-        #   xt      = original noisy input
-        #   x0_pred = model’s denoised prediction
-        #   xs      = list of next-step samples (here just x_t2)
-        # --------------------------------------------------------------------
+        # Increment training step counter  
+        self.training_step += 1
+
         return {
             "loss":    loss,
             "xt":      x_t,
             "x0_pred": distiller,
             "xs":      [x_t2],
         }
-
-
 
 
     def progdist_losses(
@@ -424,8 +458,8 @@ class KarrasDenoiser:
             loss = mean_flat(diffs) * weights
         elif self.loss_norm == "lpips":
             if x_start.shape[-1] < 256:
-                denoised_x = F.interpolate(denoised_x, size=224, mode="bilinear")
-                target_x = F.interpolate(target_x, size=224, mode="bilinear")
+                denoised_x = F.interpolate(denoised_x, size=128, mode="bilinear")
+                target_x = F.interpolate(target_x, size=128, mode="bilinear")
             loss = (
                 self.lpips_loss(
                     (denoised_x + 1) / 2.0,
@@ -441,7 +475,7 @@ class KarrasDenoiser:
 
         return terms
 
-    def denoise(self, model, x_t, sigmas, hr_inte):
+    def denoise(self, model, x_t, sigmas, hr_inte, mask=None):
         import torch.distributed as dist
 
         if not self.distillation:
@@ -454,7 +488,7 @@ class KarrasDenoiser:
                 for x in self.get_scalings_for_boundary_condition(sigmas)
             ]
         rescaled_t = 1000 * 0.25 * th.log(sigmas + 1e-44)
-        model_output = model(c_in * x_t, rescaled_t, hr_inte)
+        model_output = model(c_in * x_t, rescaled_t, hr_inte, mask=mask)
         denoised = c_out * model_output + c_skip * x_t
         return model_output, denoised
 
@@ -465,6 +499,8 @@ def karras_sample(
     shape,
     steps,
     hr_inte,
+    skip,
+    mask,
     clip_denoised=True,
     progress=False,
     callback=None,
@@ -480,16 +516,64 @@ def karras_sample(
     s_noise=1.0,
     generator=None,
     ts=None,
+    save_intermediate=False,
+    save_dir="./sampling_progression", 
+    save_frequency=1,
 ):
     if generator is None:
         generator = get_generator("dummy")
 
-    if sampler == "progdist":
-        sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
-    else:
-        sigmas = get_sigmas_karras(steps, sigma_min, sigma_max, rho, device=device)
+    # if sampler == "progdist":
+    #     #sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
+    #     full_sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
+    # else:
+    #     #sigmas = get_sigmas_karras(steps, sigma_min, sigma_max, rho, device=device)
+    #     full_sigmas = get_sigmas_karras(steps,     sigma_min, sigma_max, rho, device=device)
 
-    x_T = generator.randn(*shape, device=device) * sigma_max
+    # #x_T = generator.randn(*shape, device=device) * sigma_max
+    if sampler=="progdist":
+        full_sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
+    else:
+        full_sigmas = get_sigmas_karras(steps, sigma_min, sigma_max, rho, device=device)
+
+    B,C,H,W = hr_inte.shape
+    n = C*H*W
+    hr_flat = hr_inte.view(B, n)          # (B, n)
+
+    x_init = th.zeros_like(hr_flat)    # (B, n)
+
+    for i in range(B):
+        mask1d = mask[i].reshape(-1)                # (n,)
+        idx    = th.nonzero(mask1d, as_tuple=False).squeeze(1)
+        m      = idx.numel()
+
+        I_n = th.eye(n, device=mask.device)
+        A   = I_n[idx]                              # (m, n)
+
+        invAAT  = th.inverse(A @ A.T)            # (m, m)
+        A_pinv  = A.T @ invAAT                      # (n, m)
+
+        y_i     = hr_flat[i, idx]                   # (m,)
+        x_i     = A_pinv @ y_i                      # (n,)
+        x_init[i] = x_i
+    
+    if sampler == "progdist":
+        tail_start = skip + 1
+    else:
+        tail_start = skip
+
+    sigma_k = full_sigmas[skip]
+    x_0 = th.randn_like(x_init) * sigma_k      # (B, n)
+    x_T = x_init + x_0                              # (B, n)
+
+    x_T = x_T.view(B, C, H, W)
+    sigmas_tail = full_sigmas[tail_start:]
+
+    #A = mask
+    #inv_aat = th.inverse(A @ A.T) 
+    #A_pinv = A.T @ inv_aat                  
+    #x_init = A_pinv @ hr_inte                   # shape: (n, batch) → matches your setup
+    #x_T = x_init + x_0
 
     # print('sampler:', sampler)
     sample_fn = {
@@ -504,31 +588,62 @@ def karras_sample(
 
     if sampler in ["heun", "dpm"]:
         sampler_args = dict(
-            s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise
+            s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise,
+            save_intermediate=save_intermediate, save_dir=save_dir, save_frequency=save_frequency
         )
     elif sampler == "multistep":
         sampler_args = dict(
-            ts=ts, t_min=sigma_min, t_max=sigma_max, rho=diffusion.rho, steps=steps
+            ts=ts, t_min=sigma_min, t_max=sigma_max, rho=diffusion.rho, steps=steps,
+            save_intermediate=save_intermediate, save_dir=save_dir, save_frequency=save_frequency
+        )
+    elif sampler == "euler":
+        sampler_args = dict(
+            save_intermediate=save_intermediate, save_dir=save_dir, save_frequency=save_frequency
         )
     else:
         sampler_args = {}
 
     def denoiser(x_t, sigma, hr_inte):
-        _, denoised = diffusion.denoise(model, x_t, sigma, hr_inte, **model_kwargs)
+        #_, denoised = diffusion.denoise(model, x_t, sigma, hr_inte)
+        _, denoised = diffusion.denoise(model, x_t, sigma, hr_inte)
         if clip_denoised:
             denoised = denoised.clamp(-1, 1)
         return denoised
 
-    x_0 = sample_fn(
-        denoiser,
-        x_T,
-        sigmas,
-        hr_inte, 
-        generator,
-        progress=progress,
-        callback=callback,
-        **sampler_args,
-    )
+    # x_0 = sample_fn(
+    #     denoiser,
+    #     x_T,
+    #     sigmas,
+    #     hr_inte,
+    #     model_kwargs["sampling_vec"],
+    #     generator,
+    #     progress=progress,
+    #     callback=callback,
+    #     **sampler_args,
+    # )
+    # return x_0.clamp(-1, 1)
+
+    if sampler == "onestep":
+        # sample_onestep(distiller, x, sigmas, hr_inte)
+        x_0 = sample_onestep(
+            denoiser,
+            x_T,
+            sigmas_tail,
+            hr_inte,
+        )
+    else:
+        # all other samplers expect: fn(distiller, x, sigmas, hr_inte, generator, progress, callback, **sampler_args)
+        x_0 = sample_fn(
+            denoiser,
+            x_T,
+            sigmas_tail,
+            hr_inte,
+            generator,
+            progress=progress,
+            callback=callback,
+            **sampler_args,
+        )
+        
     return x_0.clamp(-1, 1)
 
 
@@ -619,6 +734,9 @@ def sample_heun(
     s_tmin=0.0,
     s_tmax=float("inf"),
     s_noise=1.0,
+    save_intermediate=False,
+    save_dir="./sampling_progression",
+    save_frequency=1,
 ):
     """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
     s_in = x.new_ones([x.shape[0]])
@@ -627,6 +745,15 @@ def sample_heun(
         # from tqdm.auto import tqdm
 
         indices = tqdm(indices)
+
+    # Save initial noisy image
+    if save_intermediate:
+        save_denoised_images(
+            x, 
+            os.path.join(save_dir, "step_00_initial"), 
+            "initial_noise", 
+            step=0
+        )
 
     for i in indices:
         gamma = (
@@ -657,10 +784,25 @@ def sample_heun(
         else:
             # Heun's method
             x_2 = x + d * dt
-            denoised_2 = denoiser(x_2, sigmas[i + 1] * s_in)
+            denoised_2 = denoiser(x_2, sigmas[i + 1] * s_in, hr_inte)
             d_2 = to_d(x_2, sigmas[i + 1], denoised_2)
             d_prime = (d + d_2) / 2
             x = x + d_prime * dt
+            
+        # Save intermediate results
+        if save_intermediate and (i + 1) % save_frequency == 0:
+            save_denoised_images(
+                denoised, 
+                os.path.join(save_dir, f"step_{i+1:02d}_denoised"), 
+                "denoised_pred", 
+                step=i+1
+            )
+            save_denoised_images(
+                x, 
+                os.path.join(save_dir, f"step_{i+1:02d}_sample"), 
+                "current_sample", 
+                step=i+1
+            )
     return x
 
 
@@ -673,14 +815,26 @@ def sample_euler(
     generator,
     progress=False,
     callback=None,
+    save_intermediate=False,
+    save_dir="./sampling_progression",
+    save_frequency=1,
 ):
-    """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
+    """Implements Euler method steps from Karras et al. (2022)."""
     s_in = x.new_ones([x.shape[0]])
     indices = range(len(sigmas) - 1)
     if progress:
         # from tqdm.auto import tqdm
 
         indices = tqdm(indices)
+
+    # Save initial noisy image
+    if save_intermediate:
+        save_denoised_images(
+            x, 
+            os.path.join(save_dir, "step_00_initial"), 
+            "initial_noise", 
+            step=0
+        )
 
     for i in tqdm(indices):
         sigma = sigmas[i]
@@ -697,6 +851,21 @@ def sample_euler(
             )
         dt = sigmas[i + 1] - sigma
         x = x + d * dt
+        
+        # Save intermediate results
+        if save_intermediate and (i + 1) % save_frequency == 0:
+            save_denoised_images(
+                denoised, 
+                os.path.join(save_dir, f"step_{i+1:02d}_denoised"), 
+                "denoised_pred", 
+                step=i+1
+            )
+            save_denoised_images(
+                x, 
+                os.path.join(save_dir, f"step_{i+1:02d}_sample"), 
+                "current_sample", 
+                step=i+1
+            )
     return x
 
 
@@ -783,10 +952,22 @@ def stochastic_iterative_sampler(
     t_max=80.0,
     rho=7.0,
     steps=40,
+    save_intermediate=False,
+    save_dir="./sampling_progression",
+    save_frequency=1,
 ):
     t_max_rho = t_max ** (1 / rho)
     t_min_rho = t_min ** (1 / rho)
     s_in = x.new_ones([x.shape[0]])
+
+    # Save initial noisy image
+    if save_intermediate:
+        save_denoised_images(
+            x, 
+            os.path.join(save_dir, "step_00_initial"), 
+            "initial_noise", 
+            step=0
+        )
 
     for i in tqdm(range(len(ts) - 1)):
         t = (t_max_rho + ts[i] / (steps - 1) * (t_min_rho - t_max_rho)) ** rho
@@ -794,6 +975,21 @@ def stochastic_iterative_sampler(
         next_t = (t_max_rho + ts[i + 1] / (steps - 1) * (t_min_rho - t_max_rho)) ** rho
         next_t = np.clip(next_t, t_min, t_max)
         x = x0 + generator.randn_like(x) * np.sqrt(next_t**2 - t_min**2)
+        
+        # Save intermediate results
+        if save_intermediate and (i + 1) % save_frequency == 0:
+            save_denoised_images(
+                x0, 
+                os.path.join(save_dir, f"step_{i+1:02d}_denoised"), 
+                "denoised_pred", 
+                step=i+1
+            )
+            save_denoised_images(
+                x, 
+                os.path.join(save_dir, f"step_{i+1:02d}_next_sample"), 
+                "next_sample", 
+                step=i+1
+            )
 
     return x
 
@@ -1064,3 +1260,46 @@ def iterative_superres(
         x = x0 + generator.randn_like(x) * np.sqrt(next_t**2 - t_min**2)
 
     return x, images
+
+def save_denoised_images(images, save_dir, prefix, step=None, batch_idx=None):
+    """
+    Save denoised images to disk for debugging/visualization
+    Args:
+        images: torch.Tensor of shape (B, C, H, W) with values in [-1, 1]
+        save_dir: directory to save images
+        prefix: prefix for filename (e.g., 'training', 'consistency')
+        step: training step number
+        batch_idx: batch index
+    """
+    if not isinstance(images, th.Tensor):
+        return
+    
+    # Create save directory
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Convert from [-1, 1] to [0, 1] for saving
+    images_normalized = (images.clamp(-1, 1) + 1) / 2.0
+    
+    # Save each image in the batch
+    for i in range(images.shape[0]):
+        if step is not None and batch_idx is not None:
+            filename = f"{prefix}_step{step}_batch{batch_idx}_img{i}.png"
+        elif step is not None:
+            filename = f"{prefix}_step{step}_img{i}.png"
+        else:
+            filename = f"{prefix}_img{i}.png"
+        
+        filepath = os.path.join(save_dir, filename)
+        
+        # Handle different channel dimensions
+        img = images_normalized[i]
+        if img.shape[0] == 1:  # Grayscale
+            img_np = img.squeeze(0).detach().cpu().numpy()
+            plt.imsave(filepath, img_np, cmap='gray', vmin=0, vmax=1)
+        elif img.shape[0] == 3:  # RGB
+            img_np = img.permute(1, 2, 0).detach().cpu().numpy()
+            plt.imsave(filepath, img_np, vmin=0, vmax=1)
+        else:
+            # For other channel numbers, save as grayscale using first channel
+            img_np = img[0].detach().cpu().numpy()
+            plt.imsave(filepath, img_np, cmap='gray', vmin=0, vmax=1)

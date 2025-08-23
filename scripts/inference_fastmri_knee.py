@@ -4,16 +4,21 @@ import argparse
 import numpy as np
 from torchvision.utils import save_image
 from tqdm import tqdm
+import torch.nn.functional as F
 
-#from torchmetrics.functional import peak_signal_noise_ratio as psnr_func
-#from torchmetrics.functional import structural_similarity_index_measure as ssim_func
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from pathlib import Path
+import sys
+import os
+# allow imports from project root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cm import dist_util, logger
-from cm.MRI_datasets_dicom_kspace import load_data_from_dicom
+from cm.MRI_datasets_knee_kspace import create_dataloader
 from cm.script_util import model_and_diffusion_defaults, create_model_and_diffusion
 from cm.karras_diffusion import karras_sample
+
 
 
 def save_images(tensor, save_dir, prefix, start_idx):
@@ -24,23 +29,32 @@ def save_images(tensor, save_dir, prefix, start_idx):
         save_image(tensor[i], save_path)
 
 def compute_batch_metrics(pred, target):
-    """
-    pred, target: [B, 1, H, W] in [0, 1]
-    Returns: list of PSNRs, list of SSIMs
-    """
-
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(pred.device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(pred.device)
-
-    psnr_list = []
-    ssim_list = []
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=False).to(pred.device)
+    
+    psnr_list, ssim_list, lpips_list = [], [], []
+    
     for i in range(pred.shape[0]):
+        # PSNR and SSIM
         psnr = psnr_metric(pred[i:i+1], target[i:i+1])
         ssim = ssim_metric(pred[i:i+1], target[i:i+1])
+        
+        # LPIPS: Convert grayscale to RGB and normalize to [-1, 1]
+        pred_rgb = pred[i:i+1].repeat(1, 3, 1, 1)  # [1, 1, H, W] -> [1, 3, H, W]
+        target_rgb = target[i:i+1].repeat(1, 3, 1, 1)  # [1, 1, H, W] -> [1, 3, H, W]
+        
+        # Convert from [0, 1] to [-1, 1] for LPIPS
+        pred_rgb = pred_rgb * 2.0 - 1.0
+        target_rgb = target_rgb * 2.0 - 1.0
+        
+        lpips = lpips_metric(pred_rgb, target_rgb)
+        
         psnr_list.append(psnr.item())
         ssim_list.append(ssim.item())
-    return psnr_list, ssim_list
-
+        lpips_list.append(lpips.item())
+    
+    return psnr_list, ssim_list, lpips_list
 
 def main():
     parser = argparse.ArgumentParser()
@@ -48,26 +62,19 @@ def main():
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default="./samples")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--scan", type=str, default="AX_T2")
     parser.add_argument("--image_size", type=int, default=320)
-    parser.add_argument("--crop", type=int, default=288)
-    parser.add_argument("--R", type=int, default=4)
-    parser.add_argument("--use_fp16", type=bool, default=True)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--sampler", type=str, default="heun")
     parser.add_argument("--ts", type=str, default="")
-    parser.add_argument("--max_batches", type=int, default=20)
+    #parser.add_argument("--max_batches", type=int, default=20)
+    parser.add_argument("--use_fp16", action="store_true")
     parser.add_argument("--gauss_accel", type=int, default=8)
-    parser.add_argument("--uniform_accel", type=int, default=4)
-    parser.add_argument("--gauss_sigma", type=float, default=0.3)
-    parser.add_argument("--calib_lines", type=int, default=9)
-    parser.add_argument("--lr", type=float, default=1e-4)
-
+    parser.add_argument("--gauss_sigma", type=float, default=0.5)
+    parser.add_argument("--skip", type=int, default=0)
     args = parser.parse_args()
 
     logger.configure()
     dist_util.setup_dist()
-
     os.makedirs(args.save_dir, exist_ok=True)
     interp_dir = os.path.join(args.save_dir, "interp")
     hr_dir     = os.path.join(args.save_dir, "hr")
@@ -76,43 +83,44 @@ def main():
     os.makedirs(hr_dir,     exist_ok=True)
     os.makedirs(recon_dir,  exist_ok=True)
 
-    logger.log(f"Saving output images to: {args.save_dir}")
-    logger.log("Loading validation data...")
+    # Setup dataset config
+    from ml_collections import ConfigDict
+    configs = ConfigDict()
+    configs.data = ConfigDict({
+        "root": args.data_dir,
+        "mask_type": "gauss",
+        "gauss_accel": args.gauss_accel,
+        "gauss_sigma": args.gauss_sigma,
+        "image_size": args.image_size,
+        "is_complex": True,
+        "magpha": False,
+        "h5_key": "kspace",
+        "skip": args.skip,
+    })
+    configs.training = ConfigDict({
+        "batch_size": args.batch_size,
+        "num_workers": 1
+    })
 
-    dataset = load_data_from_dicom(
-        root_path=args.data_dir,
-        batch_size=args.batch_size,
-        scan=args.scan,
-        scale=None,
-        image_size=args.image_size,
-        crop=args.crop,
-        mode="val",
-        select_k=300,
-        select_k_start=150,
-        gauss_accel=args.gauss_accel,
-        uniform_accel=args.uniform_accel,
-        gauss_sigma=args.gauss_sigma,
-        calib_lines=args.calib_lines,
-    )
+    logger.log("Loading validation dataset...")
+    #dataset = create_dataloader(configs, data_dir=args.data_dir, evaluation=True, sort=True)
+    _, test_loader = create_dataloader(configs, data_dir=args.data_dir, evaluation=True, sort=True)
 
     logger.log("Creating model and diffusion...")
     model_kwargs = model_and_diffusion_defaults()
+    #model_kwargs.update({"image_size": args.image_size})
     model_kwargs.update({
-        "image_size": args.image_size,
-        "class_cond": True,
-        "use_fp16": args.use_fp16,
-        "num_channels": 128,
-        "num_head_channels": 64,
-        "num_res_blocks": 2,
-        "resblock_updown": True,
-        "use_scale_shift_norm": True,
-        "attention_resolutions": "32,16",
-        "learn_sigma": False,
-        "loss_norm": "lpips",
-        "adaptive_loss": False,
-        "channel_mult": "1,2,4,8",
-    })
-
+    "image_size": args.image_size,
+    "use_fp16": args.use_fp16,
+    "num_channels": 128,
+    "num_res_blocks": 2,
+    #"channel_mult": "1,2,4,8",
+    "num_head_channels": 64,   
+    "learn_sigma": False,
+    "resblock_updown": True,
+    "use_scale_shift_norm": True,
+    "attention_resolutions": "32,16",
+})
     model, diffusion = create_model_and_diffusion(**model_kwargs)
     logger.log(f"Loading model weights from: {args.model_path}")
     
@@ -127,43 +135,42 @@ def main():
         model.convert_to_fp16()
 
     logger.log("Starting inference...")
-    all_psnr = []
-    all_ssim = []
+    all_psnr, all_ssim, all_lpips = [], [], []
 
-    for i, batch in enumerate(tqdm(dataset)):
-        if i >= args.max_batches:
-            break
+    for i, batch in enumerate(tqdm(test_loader, desc="Inference Progress")):
+        # if i >= args.max_batches:
+        #     break
 
-        hr      = batch["hr_img"].to(dist_util.dev())        # [B,1,H,W] in [-1,1]
+        hr      = batch["hr_img"].to(dist_util.dev())
         hr_inte = batch["hr_inte"].to(dist_util.dev())
-        mask    = batch["mask"].to(dist_util.dev())
+        ts = list(range(args.steps))
+        mask = batch["mask"].to(dist_util.dev())
+        x_init = batch["lr_img"].to(dist_util.dev())
 
         with torch.no_grad():
             recon = karras_sample(
                 diffusion,
                 model,
                 shape=hr_inte.shape,
+                #sampler="multistep",
                 steps=args.steps,
-                hr_inte=hr_inte,
+                model_kwargs={"hr_inte": hr_inte},
+                x_init=x_init,
+                #mask=mask,
                 clip_denoised=True,
-                model_kwargs={"hr_inte": hr_inte, "kspace_mask": mask},
                 device=dist_util.dev(),
                 sampler=args.sampler,
-                ts=tuple(int(x) for x in args.ts.split(",")) if args.ts else None,
+                ts=ts,
+                #ts=tuple(int(x) for x in args.ts.split(",")) if args.ts else None,
             )
-            print(f"Batch {i}: hr {hr.shape}, hr_inte {hr_inte.shape}, mask {mask.shape}, recon {recon.shape}")
 
-        # Convert to [0,1] range for evaluation
         recon_01 = (recon.clamp(-1, 1) + 1) / 2
         hr_01    = (hr.clamp(-1, 1) + 1) / 2
 
-        psnr_batch, ssim_batch = compute_batch_metrics(recon_01, hr_01)
-
-        for b in range(len(psnr_batch)):
-            idx = i * args.batch_size + b
-            print(f"Sample {idx:04d} - PSNR: {psnr_batch[b]:.2f} dB | SSIM: {ssim_batch[b]:.4f}")
-            all_psnr.append(psnr_batch[b])
-            all_ssim.append(ssim_batch[b])
+        psnr_batch, ssim_batch, lpips_batch = compute_batch_metrics(recon_01, hr_01)
+        all_psnr.extend(psnr_batch)
+        all_ssim.extend(ssim_batch)
+        all_lpips.extend(lpips_batch)
 
         base_idx = i * args.batch_size
         save_images(hr,      hr_dir,    "hr",    base_idx)
@@ -172,8 +179,11 @@ def main():
 
     mean_psnr = np.mean(all_psnr)
     mean_ssim = np.mean(all_ssim)
+    mean_lpips = np.mean(all_lpips)
+    
     logger.log(f"Average PSNR over {len(all_psnr)} samples: {mean_psnr:.2f} dB")
     logger.log(f"Average SSIM over {len(all_ssim)} samples: {mean_ssim:.4f}")
+    logger.log(f"Average LPIPS over {len(all_lpips)} samples: {mean_lpips:.4f}")
     logger.log("Inference completed.")
 
 if __name__ == "__main__":

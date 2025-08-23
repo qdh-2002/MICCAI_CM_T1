@@ -125,11 +125,10 @@ def mask_2d_gauss_accel(H, W, accel=8, sigma_frac=0.5):
 
 class FastMRIH5SliceDataset(Dataset):
     """Dataset of individual slices from FastMRI single-coil .h5 files, cropping/padding to a fixed shape."""
-    def __init__(self, root, is_complex=False, key='reconstruction_rss', target_shape=None, sort=True, is_test=False, train_test_split=0.8):
+    def __init__(self, root, is_complex=False, key='reconstruction_rss', target_shape=None, sort=True):
         root = Path(root)
         self.key = key
         self.is_complex = is_complex
-        self.is_test = is_test
 
         # discover all .h5 files
         files = sorted(root.rglob('*.h5')) if sort else list(root.rglob('*.h5'))
@@ -150,14 +149,6 @@ class FastMRIH5SliceDataset(Dataset):
         if not self.index:
             raise RuntimeError(f"No valid slices found in {root}")
 
-        # Split into train/test if requested
-        if train_test_split is not None and train_test_split > 0.0 and train_test_split < 1.0:
-            split_idx = int(len(self.index) * train_test_split)
-            if is_test:
-                self.index = self.index[split_idx:]
-            else:
-                self.index = self.index[:split_idx]
-
         # determine target spatial shape
         if target_shape is None:
             f0, idx0 = self.index[0]
@@ -166,10 +157,6 @@ class FastMRIH5SliceDataset(Dataset):
             self.target_shape = sample.shape[-2:]
         else:
             self.target_shape = target_shape
-
-        # For test mode, use a fixed mask pattern to ensure consistency
-        if self.is_test:
-            self.fixed_mask = None
 
     def __len__(self):
         return len(self.index)
@@ -267,32 +254,23 @@ class FastMRIH5SliceDataset(Dataset):
 
         H, W = hr_img.shape
 
-        # Generate mask based on mode
-        if self.is_test:
-            # For test mode, use a fixed mask pattern for consistency
-            if self.fixed_mask is None or self.fixed_mask.shape != (H, W):
-                # Generate a single fixed mask for all test samples
-                # Use 1D uniform sampling for consistency
-                self.fixed_mask = mask_1d_uniform(H, W, accel=4, acs_frac=0.04)
+        # --- begin multi‐strategy masking ---
+        p = np.random.rand()
+        if p < 0.3:
+            # 30%: 2D Gaussian accel
+            mask = mask_2d_gauss_accel(H, W, accel=8, sigma_frac=0.3)
+            #mask = mask_1d_uniform(H, W, accel=4, acs_frac=0.04)
+            #mask = mask_1d_gauss(H, W, sigma_frac=0.3, accel=4, acs_frac=0.04)
 
-                import matplotlib.pyplot as plt, os
-                os.makedirs("debug_masks", exist_ok=True)
-                plt.imsave("debug_masks/fixed_mask.png", self.fixed_mask, cmap="gray")
-                print(f"[Debug] Saved fixed mask to debug_masks/fixed_mask.png")
-                
-            mask = self.fixed_mask.copy()
+        elif p < 0.6:
+            # next 30%: 1D uniform
+            mask = mask_1d_uniform(H, W, accel=4, acs_frac=0.04)
+            #mask = mask_1d_gauss(H, W, sigma_frac=0.3, accel=4, acs_frac=0.04)
         else:
-            # Training mode: use random masking strategies
-            p = np.random.rand()
-            if p < 0.3:
-                # 30%: 2D Gaussian accel
-                mask = mask_2d_gauss_accel(H, W, accel=8, sigma_frac=0.3)
-            elif p < 0.6:
-                # next 30%: 1D uniform
-                mask = mask_1d_uniform(H, W, accel=4, acs_frac=0.04)
-            else:
-                # final 40%: 1D Gaussian
-                mask = mask_1d_gauss(H, W, sigma_frac=0.3, accel=4, acs_frac=0.04)
+            # final 40%: 1D Gaussian
+            mask = mask_1d_gauss(H, W, sigma_frac=0.3, accel=4, acs_frac=0.04)
+        # --- end multi‐strategy masking ---
+
 
         kspace_gt_masked = kspace_gt * mask
         lr_img = np.abs(np.fft.ifft2(np.fft.ifftshift(kspace_gt_masked))).astype(np.float32)
@@ -303,6 +281,7 @@ class FastMRIH5SliceDataset(Dataset):
         hr_img = hr_img[None, ...].astype(np.float32)
         lr_img = lr_img[None, ...].astype(np.float32)
         hr_inte = hr_inte[None, ...].astype(np.float32)
+
 
         kspace_gt_masked_final = kspace_gt_masked[None, ...].astype(np.complex64)  # [1, H, W]
 
@@ -328,7 +307,7 @@ class FastMRIH5SliceDataset(Dataset):
         }
 
 
-def create_dataloader(configs, data_dir=None, evaluation=False, sort=True, train_test_split=0.8):
+def create_dataloader(configs, data_dir=None, evaluation=False, sort=True):
     """
     Create PyTorch DataLoader(s) for FastMRI H5 slices.
 
@@ -343,49 +322,24 @@ def create_dataloader(configs, data_dir=None, evaluation=False, sort=True, train
       data_dir: overrides configs.data.root if provided
       evaluation: if True, disables shuffle
       sort: whether to sort files
-      train_test_split: fraction for train split (0.8 = 80% train, 20% test)
 
     Returns:
       (train_loader, val_loader)
     """
     root = data_dir or configs.data.root
 
-    # Create training dataset
-    train_ds = FastMRIH5SliceDataset(
+    ds = FastMRIH5SliceDataset(
         root,
         is_complex=getattr(configs.data, 'is_complex', True),
         key=getattr(configs.data, 'h5_key', 'reconstruction_rss'),
         target_shape=(configs.data.image_size, configs.data.image_size),
-        sort=sort,
-        is_test=False,
-        train_test_split=train_test_split
+        sort=sort
     )
-    
-    # Create test dataset with fixed mask
-    test_ds = FastMRIH5SliceDataset(
-        root,
-        is_complex=getattr(configs.data, 'is_complex', True),
-        key=getattr(configs.data, 'h5_key', 'reconstruction_rss'),
-        target_shape=(configs.data.image_size, configs.data.image_size),
-        sort=sort,
-        is_test=True,
-        train_test_split=train_test_split
-    )
-    
-    train_loader = DataLoader(
-        train_ds,
+    loader = DataLoader(
+        ds,
         batch_size=configs.training.batch_size,
         shuffle=not evaluation,
         num_workers=configs.training.num_workers,
         drop_last=not evaluation
     )
-    
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=configs.training.batch_size,
-        shuffle=False,  # Never shuffle test data
-        num_workers=configs.training.num_workers,
-        drop_last=False  # Don't drop last batch for test
-    )
-    
-    return train_loader, test_loader
+    return loader, loader

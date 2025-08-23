@@ -42,7 +42,6 @@ def model_and_diffusion_defaults():
         channel_mult="",
         dropout=0.0,
         loss_norm='lpips',
-        adaptive_loss = False,
         class_cond=False,
         use_checkpoint=False,
         use_scale_shift_norm=True,
@@ -69,7 +68,6 @@ def create_model_and_diffusion(
     attention_resolutions,
     dropout,
     loss_norm,
-    adaptive_loss,
     use_checkpoint,
     use_scale_shift_norm,
     resblock_updown,
@@ -106,8 +104,7 @@ def create_model_and_diffusion(
         sigma_min=sigma_min,
         distillation=distillation,
         weight_schedule=weight_schedule,
-        loss_norm = loss_norm,
-        adaptive_loss = adaptive_loss
+        loss_norm=loss_norm,
     )
     return model, diffusion
 
@@ -136,7 +133,7 @@ def create_model(
             channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
         elif image_size == 256:
             channel_mult = (1, 1, 2, 2, 4, 4)
-        elif image_size == 128:
+        elif image_size == 320:
             channel_mult = (1, 1, 2, 3, 4)
         elif image_size == 224:
             channel_mult = (1, 2, 4, 8)

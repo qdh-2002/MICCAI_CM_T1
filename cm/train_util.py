@@ -127,7 +127,7 @@ class TrainLoop:
                 output_device=dist_util.dev(),
                 broadcast_buffers=False,
                 bucket_cap_mb=128,
-                find_unused_parameters=False,
+                find_unused_parameters=True,  # Set to True to avoid unused parameter errors
             )
         else:
             if dist.get_world_size() > 1:
@@ -356,7 +356,10 @@ class CMTrainLoop(TrainLoop):
                     torch.cuda.empty_cache()
                     if os.environ.get("DIFFUSION_TRAINING_TEST") and self.step > 0:
                         return
-                    self.val()
+                    # Validation disabled
+                    # if self.val_data is not None and self.global_step % 1000 == 0:
+                    #     logger.log("Running validation...")
+                    #     self.val()
                 # periodic log
                 if self.global_step % self.log_interval == 0:
                     logger.log(datetime.now())
@@ -368,8 +371,19 @@ class CMTrainLoop(TrainLoop):
         self.mp_trainer.zero_grad()
         total = batch['lr_img'].shape[0]
         for i in range(0, total, self.microbatch):
-            micro = {k: v[i : i + self.microbatch].to(dist_util.dev()) for k, v in batch.items()}
-            micro["sampling_vec"] = micro["sampling_vec"].to(dist_util.dev())
+            # Debug: print batch shapes before slicing
+            print(f"Debug batch shapes:")
+            for k, v in batch.items():
+                print(f"  {k}: {v.shape}")
+            
+            try:
+                micro = {k: v[i : i + self.microbatch].to(dist_util.dev()) for k, v in batch.items()}
+            except IndexError as e:
+                print(f"IndexError during microbatch slicing: {e}")
+                print(f"i={i}, microbatch={self.microbatch}, total={total}")
+                for k, v in batch.items():
+                    print(f"  {k}: shape={v.shape}, ndim={v.ndim}")
+                raise
 
             last = (i + self.microbatch) >= total
             t, weights = self.schedule_sampler.sample(micro['lr_img'].shape[0], dist_util.dev())
@@ -381,11 +395,11 @@ class CMTrainLoop(TrainLoop):
             compute_losses = functools.partial(
                 self.diffusion.consistency_losses,
                 self.ddp_model,
-                micro,
+                micro["gt"],  # Extract ground truth tensor from batch dictionary
                 num_scales,
                 model_kwargs={
-                    "hr_inte":      micro["hr_inte"],
-                    "sampling_vec": micro["sampling_vec"],
+                    "hr_inte": micro["hr_inte"],
+                    "kspace_mask": micro["mask"] if "mask" in micro else None,
                 },
                 target_model=self.target_model,
                 teacher_model=self.teacher_model,
@@ -430,9 +444,16 @@ class CMTrainLoop(TrainLoop):
 
                 if "hr_img" in micro:
                     gt = micro["hr_img"].detach().cpu()
-                    to_dump["gt"] = gt
+                    to_dump["gt"] = gt[:1]
 
                 hr_inte = micro["hr_inte"].detach()
+                if "x_init" in micro:
+                    x_init = micro["x_init"].detach()
+                    to_dump["x_init"] = x_init[:1]
+                else:
+                    # Create a default initialization tensor if x_init is not available
+                    x_init = hr_inte.detach()  # Use hr_inte as fallback initialization
+
                 h, w = hr_inte.shape[-2:]
                 with torch.no_grad():
                     sample = karras_sample(
@@ -440,16 +461,16 @@ class CMTrainLoop(TrainLoop):
                         self.target_model,
                         (1, 1, h, w),
                         steps=1281,
-                        hr_inte=hr_inte[:1],  # take first sample in batch
+                        x_init=x_init[:1],  # Use the actual x_init tensor
                         model_kwargs={
                             "hr_inte": hr_inte[:1],
-                            "sampling_vec": micro["sampling_vec"][:1],
+                            "kspace_mask": micro["mask"][:1] if "mask" in micro else None
                         },
                         device=dist_util.dev(),
                         clip_denoised=True,
                         sampler='onestep',
                     ).detach().cpu()
-                to_dump["sample"] = sample
+                #to_dump["sample"] = sample
 
                 # now save everything in one loop
                 for name, tensor in to_dump.items():
@@ -498,15 +519,17 @@ class CMTrainLoop(TrainLoop):
                 hr_img = v['hr_img'].to(dist_util.dev())
                 h, w = hr_img.shape[-2:]
                 hr_inte = v['hr_inte'].to(dist_util.dev())
+                x_init = v['lr_img'].to(dist_util.dev())  # Use lr_img as initial condition
                 sample = karras_sample(
                     self.diffusion,
                     self.target_model,
                     (1,1,h,w),
                     steps=1281,
-                    hr_inte=hr_inte,
+                    x_init=x_init,  # Use x_init parameter correctly
                     model_kwargs={
                         "hr_inte": hr_inte,
-                        "sampling_vec": v["sampling_vec"].to(dist_util.dev()),
+                        "kspace_mask": v["mask"] if "mask" in v else None,
+                        "mask": v["mask"] if "mask" in v else None,
                     },
                     device=dist_util.dev(),
                     clip_denoised=True,
